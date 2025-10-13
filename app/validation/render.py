@@ -18,6 +18,6 @@ def display_validation_result(data: dict) -> None:
             result = checks_source.get(check_key)
             if isinstance(result, bool):
                 if result:
-                    st.error(msg_map[result])
-                else:
                     st.success(msg_map[result])
+                else:
+                    st.error(msg_map[result])
