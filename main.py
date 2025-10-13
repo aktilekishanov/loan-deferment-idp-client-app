@@ -1,9 +1,14 @@
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 import re
+import json
 
-import boto3
 from botocore.exceptions import BotoCoreError, NoCredentialsError, ClientError
 import streamlit as st
+from app.config import load_config
+from app.aws.session import get_s3_client
+from app.aws.s3_ops import get_next_upload_folder, upload_fileobj, put_json, get_json_or_none
+from app.utils.polling import wait_for
+from app.validation.render import display_validation_result
 
 # ======================= UI ЧАСТЬ =========================
 st.set_page_config(page_title="S3 File Uploader", layout="centered")
@@ -13,13 +18,12 @@ st.title("RB Loan Deferment IDP")
 st.write("Загрузите один файл в Amazon S3.")
 
 # --- Основные параметры ---
-AWS_PROFILE = ""   # профиль AWS из ~/.aws/credentials (оставьте пустым для env/role)
-AWS_REGION = "us-east-1"   # регион AWS
-BUCKET_NAME = "loan-deferment-idp-event-triggered-tlek"  # имя S3-бакета
-KEY_PREFIX = "requests/"  # базовый префикс для загрузок
+cfg = load_config()
 
 # --- Кастомизация интерфейса ---
-st.markdown("""
+
+st.markdown(
+    """
 <style>
 .block-container{max-width:980px;padding-top:1.25rem;}
 .meta{color:#6b7280;font-size:0.92rem;margin:0.25rem 0 1rem 0;}
@@ -30,27 +34,59 @@ st.markdown("""
 .stButton>button{border-radius:10px;padding:.65rem 1rem;font-weight:600;}
 .stDownloadButton>button{border-radius:10px;}
 </style>
-""", unsafe_allow_html=True)
+""",
+    unsafe_allow_html=True,
+)
 
-with st.expander("Помощь и настройка", expanded=False):
-    tabs = st.tabs(["Запуск приложения", "Создание Access Key", "Окружение"])
-    with tabs[0]:
-        st.markdown("#### 1) Установите AWS CLI v2")
-        st.code('''curl "https://awscli.amazonaws.com/AWSCLIV2.pkg" -o "AWSCLIV2.pkg"\nsudo installer -pkg AWSCLIV2.pkg -target /''', language="bash")
-        st.code("aws --version", language="bash")
-        st.markdown("#### 2) Настройте учётные данные")
-        st.code("aws configure", language="bash")
-        st.markdown("#### 3) Запустите приложение")
-        st.code("streamlit run main.py", language="bash")
-    with tabs[1]:
-        st.markdown("### 🔑 Создание Access Key (CLI)")
-        st.markdown("Программные ключи нужны для работы из кода/CLI. Создайте их в AWS IAM.")
-    with tabs[2]:
-        st.markdown("### Окружение")
-        st.markdown(f"- Bucket: `{BUCKET_NAME}`\n- Region: `{AWS_REGION}`")
+# --- Причина отсрочки (вне формы для динамики) ---
+reasons_map = {
+    "Временная нетрудоспособность заемщика по причине болезни": [
+        "Лист временной нетрудоспособности (больничный лист)",
+        "Выписка из стационара (выписной эпикриз)",
+        "Больничный лист на сопровождающего (если предусмотрено)",
+        "Заключение врачебно-консультативной комиссии (ВКК).",
+        "Справка об инвалидности.",
+        "Справка о степени утраты общей трудоспособности.",
+    ],
+    "Уход заемщика в декретный отпуск": [
+        "Лист временной нетрудоспособности (больничный лист)",
+        "Приказ о выходе в декретный отпуск по уходу за ребенком",
+        "Справка о выходе в декретный отпуск по уходу за ребенком",
+    ],
+    "Потеря дохода заемщика (увольнение, сокращение, отпуск без содержания и т.д.)": [
+        "Приказ/Справка о расторжении трудового договора",
+        "Справка о регистрации в качестве безработного",
+        "Приказ работодателя о предоставлении отпуска без сохранения заработной платы",
+        "Справка о неполучении доходов",
+        "Уведомление о регистрации в качестве лица, ищущего работу",
+        "Лица, зарегистрированные в качестве безработных",
+    ],
+}
+fio = st.text_input("ФИО", placeholder="Иванов Иван Иванович")
+
+reason_options = ["Выберите причину"] + list(reasons_map.keys())
+reason = st.selectbox(
+    "Причина отсрочки",
+    options=reason_options,
+    index=0,
+    help="Сначала выберите причину, затем подходящий тип документа",
+    key="reason",
+)
+
+
+doc_options = ["Выберите тип документа"] + (
+    reasons_map[reason] if reason in reasons_map else []
+)
+doc_type = st.selectbox(
+    "Тип документа",
+    options=doc_options,
+    index=0,
+    key="doc_type",
+)
 
 # --- Форма загрузки ---
 with st.form("upload_form", clear_on_submit=False):
+
     uploaded_file = st.file_uploader(
         "Выберите документ",
         type=["pdf", "jpg", "png", "jpeg"],
@@ -60,72 +96,101 @@ with st.form("upload_form", clear_on_submit=False):
     submitted = st.form_submit_button("Загрузить", type="primary")
 
 
-# ===================== ФУНКЦИИ ============================
-
-def get_s3_client(profile, region_name):
-    if profile:
-        session = boto3.session.Session(profile_name=profile, region_name=region_name or None)
-        return session.client("s3")
-    return boto3.client("s3", region_name=region_name or None)
-
-def get_next_upload_folder(s3_client, bucket, prefix):
-    try:
-        paginator = s3_client.get_paginator("list_objects_v2")
-        existing_max = 0
-        for page in paginator.paginate(Bucket=bucket, Prefix=prefix, Delimiter="/"):
-            for cp in page.get("CommonPrefixes", []) or []:
-                p = cp.get("Prefix", "")
-                m = re.search(r"upload_id_(\d{3,})/\Z", p)
-                if m:
-                    existing_max = max(existing_max, int(m.group(1)))
-        next_id = existing_max + 1
-        return f"{prefix}upload_id_{next_id:03d}/"
-    except Exception:
-        ts = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
-        return f"{prefix}upload_id_{ts}/"
-
 # =============== ОСНОВНОЙ ПРОЦЕСС =========================
 if submitted:
-    if not BUCKET_NAME:
+    if not cfg.bucket_name:
         st.error("S3-бакет не настроен.")
+    elif not fio:
+        st.error("Укажите ФИО.")
+    elif reason == "Выберите причину":
+        st.error("Выберите причину отсрочки.")
+    elif doc_type == "Выберите тип документа":
+        st.error("Выберите тип документа.")
     elif not uploaded_file:
         st.error("Не выбран файл для загрузки.")
     else:
         try:
-            s3 = get_s3_client(AWS_PROFILE.strip() or None, AWS_REGION)
+            s3 = get_s3_client(cfg.aws_profile.strip() or None, cfg.aws_region)
 
             original_name = uploaded_file.name
-            base_prefix = (KEY_PREFIX or "").strip() or "uploads/"
+            base_prefix = (cfg.key_prefix or "").strip() or "uploads/"
             if base_prefix and not base_prefix.endswith("/"):
                 base_prefix += "/"
 
-            upload_folder = get_next_upload_folder(s3, BUCKET_NAME, base_prefix)
+            upload_folder = get_next_upload_folder(s3, cfg.bucket_name, base_prefix)
             input_folder = f"{upload_folder}input/"
             key = f"{input_folder}{original_name}"
 
-
             uploaded_file.seek(0)
-            content_type = getattr(uploaded_file, "type", None) or "application/octet-stream"
+            content_type = (
+                getattr(uploaded_file, "type", None) or "application/octet-stream"
+            )
             with st.status("Загрузка файла...", expanded=False) as status:
-                s3.upload_fileobj(
-                    Fileobj=uploaded_file,
-                    Bucket=BUCKET_NAME,
-                    Key=key,
-                    ExtraArgs={"ContentType": content_type},
+                upload_fileobj(
+                    s3_client=s3,
+                    bucket=cfg.bucket_name,
+                    key=key,
+                    fileobj=uploaded_file,
+                    content_type=content_type,
                 )
+                request_dt = datetime.now(timezone(timedelta(hours=cfg.timezone_offset_hours)))
+                request_date = request_dt.strftime("%d.%m.%Y")
+                meta_key = f"{upload_folder}metadata.json"
+                metadata = {"full_name": fio, "request_reason": reason, "doc_type": doc_type, "request_date": request_date}
+                put_json(s3_client=s3, bucket=cfg.bucket_name, key=meta_key, data=metadata)
+                s3_uri = f"s3://{cfg.bucket_name}/{key}"
+                s3_meta_uri = f"s3://{cfg.bucket_name}/{meta_key}"
+                st.write(f"Файл успешно загружен в {s3_uri}")
+                st.write(f"Метаданные успешно загружены в {s3_meta_uri}")
                 status.update(label="Файл загружен", state="complete")
 
-            s3_uri = f"s3://{BUCKET_NAME}/{key}"
-            st.success(f"Файл успешно загружен в {s3_uri}")
-
-            st.session_state["last_s3_bucket"] = BUCKET_NAME
+            st.session_state["last_s3_bucket"] = cfg.bucket_name
             st.session_state["last_s3_key"] = key
             st.session_state["last_s3_uri"] = s3_uri
 
+            st.session_state["last_s3_meta_key"] = meta_key
+            st.session_state["last_s3_meta_uri"] = s3_meta_uri
+
+            st.session_state["last_upload_folder"] = upload_folder
+            result_key = f"{upload_folder}output/validation.json"
+            st.session_state["last_validation_key"] = result_key
+
+            with st.status("Ожидание результата обработки...", expanded=False) as status:
+                validation = wait_for(lambda: get_json_or_none(s3, cfg.bucket_name, result_key), timeout_sec=18, interval_sec=1.0)
+                if validation is not None:
+                    status.update(label="Результаты получены", state="complete")
+                    st.session_state["last_validation"] = validation
+                    display_validation_result(validation)
+                else:
+                    status.update(label="Результаты пока не готовы", state="complete")
+
         except NoCredentialsError:
-            st.error("AWS-учётные данные не найдены. Настройте их через ~/.aws/credentials или переменные окружения.")
+            st.error(
+                "AWS-учётные данные не найдены. Настройте их через ~/.aws/credentials или переменные окружения."
+            )
+        except ClientError as e:
+            err = e.response.get("Error", {})
+            st.error(
+                f"AWS ClientError: {err.get('Code', 'Unknown')} - {err.get('Message', str(e))}"
+            )
+        except (BotoCoreError, Exception) as e:
+            st.error(f"Ошибка при загрузке: {e}")
+
+if st.session_state.get("last_upload_folder"):
+    if st.button("Проверить результат", key="check_validation"):
+        try:
+            s3 = get_s3_client(cfg.aws_profile.strip() or None, cfg.aws_region)
+            result_key = st.session_state.get("last_validation_key") or f"{st.session_state['last_upload_folder']}output/validation.json"
+            with st.status("Проверка результата...", expanded=False) as status:
+                validation = wait_for(lambda: get_json_or_none(s3, cfg.bucket_name, result_key), timeout_sec=6, interval_sec=1.0)
+                if validation is not None:
+                    status.update(label="Результаты получены", state="complete")
+                    st.session_state["last_validation"] = validation
+                    display_validation_result(validation)
+                else:
+                    status.update(label="Результаты не найдены", state="complete")
         except ClientError as e:
             err = e.response.get("Error", {})
             st.error(f"AWS ClientError: {err.get('Code', 'Unknown')} - {err.get('Message', str(e))}")
         except (BotoCoreError, Exception) as e:
-            st.error(f"Ошибка при загрузке: {e}")
+            st.error(f"Ошибка при проверке: {e}")
