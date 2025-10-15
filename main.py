@@ -1,6 +1,7 @@
 from datetime import datetime, timezone, timedelta
 import re
 import json
+from io import BytesIO
 
 from botocore.exceptions import BotoCoreError, NoCredentialsError, ClientError
 import streamlit as st
@@ -9,6 +10,7 @@ from app.aws.session import get_s3_client
 from app.aws.s3_ops import get_next_upload_folder, upload_fileobj, put_json, get_json_or_none
 from app.utils.polling import wait_for
 from app.validation.render import display_validation_result
+from PyPDF2 import PdfReader
 
 # ======================= UI ЧАСТЬ =========================
 st.set_page_config(page_title="S3 File Uploader", layout="centered")
@@ -101,7 +103,7 @@ if submitted:
     if not cfg.bucket_name:
         st.error("S3-бакет не настроен.")
     elif not fio:
-        st.error("Укажите ФИО.")
+        st.error("Укажите ФИО")
     elif reason == "Выберите причину":
         st.error("Выберите причину отсрочки.")
     elif doc_type == "Выберите тип документа":
@@ -109,6 +111,22 @@ if submitted:
     elif not uploaded_file:
         st.error("Не выбран файл для загрузки.")
     else:
+        # Проверка количества страниц для PDF (не более 3)
+        if (
+            getattr(uploaded_file, "type", "") == "application/pdf"
+            or str(getattr(uploaded_file, "name", "")).lower().endswith(".pdf")
+        ):
+            try:
+                pdf_bytes = uploaded_file.getvalue()
+                reader = PdfReader(BytesIO(pdf_bytes))
+                if len(reader.pages) > 3:
+                    st.error("PDF-документ должен содержать не более 3 страниц.")
+                    st.stop()
+            except Exception as e:
+                st.error(f"Не удалось прочитать PDF: {e}")
+                st.stop()
+            finally:
+                uploaded_file.seek(0)
         try:
             s3 = get_s3_client(cfg.aws_profile.strip() or None, cfg.aws_region)
 
